@@ -40,3 +40,66 @@
 - [ ] `Texture2DArray` 笔刷系统与动静分离 VBO 合批
 - [ ] Undo/Redo 状态栈
 - [ ] glTF 2.0 导出模块
+
+
+
+
+
+## 核心实现细节
+
+### 1. Parallel Transport Frame (PTF) 无扭转递推
+
+相比 Frenet 标架在拐点处法线剧烈翻转，PTF 通过**最小旋转（Minimal Rotation）**将上一帧法线 $N_{i-1}$ 沿前后切线夹角旋转至当前平面，保证管体绝对平整：
+
+```ts
+// 输入：上一节切线 T_prev、法线 N_prev；当前节切线 T_curr（均已归一化）
+function transportFrame(T_prev: Vec3, N_prev: Vec3, T_curr: Vec3) {
+  const axis = cross(T_prev, T_curr);
+  const sinTheta = length(axis);
+
+  let N_curr: Vec3;
+  if (sinTheta < 1e-6) {
+    // 直线段或极小偏转：直接沿用上一节法线，避免零向量归一化 NaN
+    N_curr = N_prev;
+  } else {
+    const k = scale(axis, 1 / sinTheta); // 旋转轴
+    const cosTheta = clamp(dot(T_prev, T_curr), -1, 1);
+    const theta = Math.acos(cosTheta);
+    // Rodrigues 旋转公式：绕轴 k 将 N_prev 旋转 theta
+    N_curr = rotateAroundAxis(N_prev, k, theta);
+    // 消除浮点累积误差：重新正交化
+    N_curr = normalize(sub(N_curr, scale(T_curr, dot(N_curr, T_curr))));
+  }
+
+  const B_curr = cross(T_curr, N_curr); // 副法线，与 N_curr 构成截面圆环基底
+  return { T: T_curr, N: N_curr, B: B_curr };
+}
+```
+
+
+
+### 2. glTF 2.0 (.glb) 二进制块与 4 字节对齐布局
+glTF 规范强制要求所有 bufferView 的 byteOffset 必须对齐到其组件类型字节长度的整数倍，且 .glb 的 BIN Chunk 总长度必须是 4 字节对齐（不足补 0x00）。
+
+[ GLB BIN Chunk Memory Layout ]
+Offset (Bytes)
+0x0000 ┌─────────────────────────────────────────┐
+       │ POSITION   (Float32 × 3 × V)            │ -> 12B/vertex (天然 4B 对齐)
+       ├─────────────────────────────────────────┤
+       │ NORMAL     (Float32 × 3 × V)            │ -> 12B/vertex (天然 4B 对齐)
+       ├─────────────────────────────────────────┤
+       │ TEXCOORD_0 (Float32 × 2 × V)            │ ->  8B/vertex (天然 4B 对齐)
+       ├─────────────────────────────────────────┤
+       │ INDICES    (Uint16  × I)                │ ->  2B/index  (奇数索引时差 2B)
+       │ [Padding: 0x00, 0x00 if (I * 2) % 4!=0] │ -> 强制补齐至 4B 边界
+       └─────────────────────────────────────────┘
+对齐计算辅助逻辑：
+
+TypeScript
+// 向上对齐到 4 字节边界
+const align4 = (byteLength: number) => (byteLength + 3) & ~3;
+
+// 写入 Uint16 索引后补齐尾部，确保下一个 bufferView 或 Chunk 结束满足规范
+const indicesByteLength = indices.byteLength;
+const paddedLength = align4(indicesByteLength);
+// 分配 ArrayBuffer 时按 paddedLength 预留，尾部默认 0x00 填充
